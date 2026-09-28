@@ -23,7 +23,7 @@ umask 077
 #   is recorded after the pull. Pinning to explicit tags can be added later.
 # ============================================================================
 
-SCRIPT_VERSION="9.3-interactive-fixed-any-password"
+SCRIPT_VERSION="9.4-interactive-fixed-all-issues"
 DMS_IMAGE="${DMS_IMAGE:-ghcr.io/docker-mailserver/docker-mailserver:latest}"
 OPENLDAP_IMAGE="${OPENLDAP_IMAGE:-vegardit/openldap:latest}"
 PHPLDAP_IMAGE="${PHPLDAP_IMAGE:-phpldapadmin/phpldapadmin:latest}"
@@ -668,6 +668,12 @@ collect_ports_and_security() {
   SUBMISSION_HOST_PORT="$(choose_port "Submission host port" "587" "5587")"
   IMAPS_HOST_PORT="$(choose_port "IMAPS host port" "993" "1993")"
 
+  # Ensure Roundcube and phpLDAPadmin ports are different
+  if [[ "$ROUNDCUBE_HOST_PORT" == "$PHPLDAP_HOST_PORT" ]]; then
+    warn "Roundcube and phpLDAPadmin cannot share the same host port." >&2
+    PHPLDAP_HOST_PORT="$(choose_port "phpLDAPadmin host port (different from Roundcube)" "$PHPLDAP_HOST_PORT" "$(find_free_port 8083)")"
+  fi
+
   blank
   echo -e "  ${BOLD}Mail security${NC}"
   echo "    Rspamd: spam filtering plus SPF/DKIM/DMARC checks and DKIM signing."
@@ -809,7 +815,7 @@ collect_accounts_and_postmaster() {
     success "Added $email."
   done
 
-  POSTMASTER_EMAIL="$(ask_default "Postmaster address" "${ACCOUNTS[0]}")"
+  POSTMASTER_EMAIL="$(ask_default "Postmaster address" "postmaster@$DOMAIN")"
   POSTMASTER_EMAIL="${POSTMASTER_EMAIL,,}"
   valid_email "$POSTMASTER_EMAIL" || die "Invalid postmaster email."
   [[ "$POSTMASTER_EMAIL" == *@$DOMAIN ]] ||
@@ -946,9 +952,27 @@ render_project_files() {
     "$PLA_DIR/storage" "$PLA_DIR/logs" \
     "$ROUNDCUBE_DIR/db" "$ROUNDCUBE_DIR/config" "$SECRETS_DIR"
   chmod 700 "$PROJECT_ROOT" "$SECRETS_DIR"
+  # phpLDAPadmin (Laravel) needs to write sessions and logs into these dirs.
+  chmod 777 "$PLA_DIR/storage" "$PLA_DIR/logs"
 
-  printf '%s\n' "$LDAP_ADMIN_PASSWORD" >"$SECRETS_DIR/ldap-admin-password"
+  printf '%s' "$LDAP_ADMIN_PASSWORD" >"$SECRETS_DIR/ldap-admin-password"
   chmod 600 "$SECRETS_DIR/ldap-admin-password"
+
+  # DMS SSL_TYPE=self-signed requires cert files to be pre-placed in the config
+  # directory.  Generate a self-signed certificate for the mail hostname now so
+  # the mailserver container starts successfully on first boot.
+  local ssl_dir="$DMS_DIR/config/ssl"
+  mkdir -p "$ssl_dir/demoCA"
+  info "Generating self-signed TLS certificate for $MAIL_HOSTNAME..."
+  openssl req -newkey rsa:4096 -x509 -days 3650 -nodes \
+    -subj "/CN=$MAIL_HOSTNAME/O=$LDAP_ORG/C=XX" \
+    -addext "subjectAltName=DNS:$MAIL_HOSTNAME,DNS:$DOMAIN" \
+    -keyout "$ssl_dir/$MAIL_HOSTNAME-key.pem" \
+    -out  "$ssl_dir/$MAIL_HOSTNAME-cert.pem" \
+    2>/dev/null || die "Failed to generate self-signed TLS certificate."
+  cp "$ssl_dir/$MAIL_HOSTNAME-cert.pem" "$ssl_dir/demoCA/cacert.pem"
+  chmod 600 "$ssl_dir/$MAIL_HOSTNAME-key.pem"
+  success "Self-signed TLS certificate written to $ssl_dir/"
 
   # vegardit/openldap documents LDAP_INIT_ROOT_USER_PW as the bootstrap
   # password variable and INIT_SH_FILE as a sourced initialization hook.
@@ -972,14 +996,23 @@ LDAP_INIT_ROOT_USER_PW="$(cat "$PW_FILE")"
   exit 1
 }
 
-CR="$(printf '\r')"
-LF="$(printf '\n')"
+# Check for carriage return.  Note: $(printf '\n') is an empty string after
+# command-substitution stripping, so we must NOT use it in a case pattern
+# (it would produce *""* which matches every string).  Use printf + head
+# instead to detect embedded newlines safely.
 case "$LDAP_INIT_ROOT_USER_PW" in
-  *"$CR"*|*"$LF"*)
-    echo "OpenLDAP bootstrap password contains a line break; this is not supported." >&2
+  *"$(printf '\r')"*)
+    echo "OpenLDAP bootstrap password contains a carriage return; this is not supported." >&2
     exit 1
     ;;
 esac
+_pw_check="${LDAP_INIT_ROOT_USER_PW}SENTINEL"
+_pw_first=$(printf '%s' "$_pw_check" | head -n 1)
+if [ "$_pw_first" != "$_pw_check" ]; then
+  echo "OpenLDAP bootstrap password contains a line break; this is not supported." >&2
+  exit 1
+fi
+unset _pw_check _pw_first
 
 export LDAP_INIT_ROOT_USER_PW
 EOF_LDAP_INIT
@@ -990,7 +1023,7 @@ OVERRIDE_HOSTNAME=$MAIL_HOSTNAME
 POSTMASTER_ADDRESS=$POSTMASTER_EMAIL
 
 ACCOUNT_PROVISIONER=LDAP
-LDAP_SERVER_HOST=ldap://ldap:389
+LDAP_SERVER_HOST=ldap://openldap:389
 LDAP_SEARCH_BASE=ou=Users,$LDAP_BASE_DN
 LDAP_BIND_DN=$LDAP_ADMIN_DN
 LDAP_BIND_PW__FILE=/run/secrets/ldap-admin-password
@@ -1002,7 +1035,7 @@ LDAP_QUERY_FILTER_GROUP=(|)
 LDAP_QUERY_FILTER_SENDERS=(&(objectClass=inetOrgPerson)(mail=%s))
 SPOOF_PROTECTION=1
 
-DOVECOT_URIS=ldap://ldap:389
+DOVECOT_URIS=ldap://openldap:389
 DOVECOT_BASE=ou=Users,$LDAP_BASE_DN
 DOVECOT_DN=$LDAP_ADMIN_DN
 DOVECOT_DNPASS__FILE=/run/secrets/ldap-admin-password
@@ -1060,7 +1093,7 @@ CACHE_DRIVER=file
 SESSION_DRIVER=file
 SESSION_LIFETIME=120
 
-LDAP_HOST=ldap
+LDAP_HOST=openldap
 LDAP_PORT=389
 LDAP_CONNECTION=ldap
 LDAP_BASE_DN=$LDAP_BASE_DN
@@ -1203,6 +1236,7 @@ services:
     image: $PHPLDAP_IMAGE
     container_name: $PLA_CONTAINER
     restart: unless-stopped
+    user: "33:33"
     env_file:
       - ./phpldapadmin/pla.env
     ports:
@@ -1272,7 +1306,6 @@ validate_compose() {
     die "OpenLDAP minimum password length is not configured as 0."
 
   success "OpenLDAP bootstrap hook and unrestricted password policy are configured."
-}
 
 wait_for_ldap() {
   local state health
@@ -1280,20 +1313,22 @@ wait_for_ldap() {
     state="$(container_state "$LDAP_CONTAINER")"
     health="$(container_health "$LDAP_CONTAINER")"
     if [[ "$state" == "running" && "$health" == "healthy" ]]; then
-      return 0
+      break
     fi
     [[ "$state" == "exited" || "$state" == "dead" ]] && return 1
+    sleep 2
+  done
+
+  info "Waiting for OpenLDAP initialization to complete..."
+  for _ in $(seq 1 60); do
+    if ${DC[@]} exec -T "$LDAP_CONTAINER" sh -c 'ldapwhoami -x -H ldap://127.0.0.1:389 -D "$1" -y /run/openldap-bootstrap/ldap-admin-password' sh "$LDAP_ADMIN_DN" >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 2
   done
   return 1
 }
 
-ldap_seed_users() {
-  step "7/10" "Initialize OpenLDAP tree and provision mailboxes"
-  divider
-
-  info "Starting OpenLDAP..."
-  ${DC[@]} compose -f "$COMPOSE_FILE" up -d openldap
 
   if ! wait_for_ldap; then
     ${DC[@]} logs --tail 180 "$LDAP_CONTAINER" || true
@@ -1301,13 +1336,6 @@ ldap_seed_users() {
   fi
   success "OpenLDAP is healthy."
 
-  info "Testing LDAP administrator bind..."
-  ${DC[@]} exec -T "$LDAP_CONTAINER" sh -c \
-    'ldapwhoami -x -H ldap://127.0.0.1:389 -D "$1" -y /run/openldap-bootstrap/ldap-admin-password' \
-    sh "$LDAP_ADMIN_DN" >/dev/null 2>&1 ||
-    die "LDAP administrator bind failed."
-
-  local ous="$TMP_DIR/mail-ous.ldif"
   cat >"$ous" <<EOF_OU
 dn: ou=Users,$LDAP_BASE_DN
 objectClass: top
@@ -1643,10 +1671,10 @@ Generated: $(date --iso-8601=seconds)
 | Setting | Value |
 |---|---|
 | ACCOUNT_PROVISIONER | LDAP |
-| LDAP server URI | ldap://ldap:389 |
+| LDAP server URI | ldap://openldap:389 |
 | LDAP search base | ou=Users,$LDAP_BASE_DN |
 | LDAP bind DN | $LDAP_ADMIN_DN |
-| Dovecot LDAP URI | ldap://ldap:389 |
+| Dovecot LDAP URI | ldap://openldap:389 |
 | Dovecot base | ou=Users,$LDAP_BASE_DN |
 | Dovecot user filter | (&(objectClass=inetOrgPerson)(mail=%{user})) |
 | Dovecot password verification | LDAP authentication bind |
@@ -1945,35 +1973,78 @@ final_screen() {
   echo -e "  ${BOLD}Path${NC}    : $PROJECT_ROOT"
   blank
 
-  echo -e "  ${GREEN}Roundcube:${NC}       http://localhost:$ROUNDCUBE_HOST_PORT"
-  echo -e "  ${GREEN}phpLDAPadmin:${NC}    http://localhost:$PHPLDAP_HOST_PORT"
-  if [[ "$HOST_BIND_ADDRESS" == "0.0.0.0" ]]; then
-    echo -e "  ${GREEN}LAN Roundcube:${NC}   http://$host_ip:$ROUNDCUBE_HOST_PORT"
-    echo -e "  ${GREEN}LAN LDAP UI:${NC}     http://$host_ip:$PHPLDAP_HOST_PORT"
-  fi
-  blank
-
-  echo -e "  ${BOLD}Mailbox accounts:${NC}"
-  for ((i=0; i<${#ACCOUNTS[@]}; i++)); do
-    printf '    %-40s role=%s\n' "${ACCOUNTS[$i]}" "${ACCOUNT_ROLES[$i]}"
-  done
-
-  blank
-  echo -e "  ${BOLD}Host ports:${NC}"
-  echo "    $SMTP_HOST_PORT    SMTP"
-  echo "    $IMAP_HOST_PORT    IMAP"
-  echo "    $SMTPS_HOST_PORT    SMTPS"
-  echo "    $SUBMISSION_HOST_PORT    SMTP Submission"
-  echo "    $IMAPS_HOST_PORT    IMAPS"
-  echo "    $ROUNDCUBE_HOST_PORT    Roundcube web"
-  echo "    $PHPLDAP_HOST_PORT    phpLDAPadmin web"
+  # Configuration summary table
+  echo -e "  ${BOLD}${CYAN}Configuration Summary${NC}"
+  echo -e "  ${DIM}┌────────────────────────┬──────────────────────────────────────────────┐${NC}"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Project Name" "$PROJECT_NAME"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Project Slug" "$PROJECT_SLUG"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Mail Domain" "$DOMAIN"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Mail Hostname" "$MAIL_HOSTNAME"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "LDAP Base DN" "$LDAP_BASE_DN"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "LDAP Admin DN" "$LDAP_ADMIN_DN"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Network Bind" "$HOST_BIND_ADDRESS"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Docker Network" "$NETWORK_NAME"
+  echo -e "  ${DIM}├────────────────────────┼──────────────────────────────────────────────┤${NC}"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "SMTP" "$HOST_BIND_ADDRESS:$SMTP_HOST_PORT → 25"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "IMAP" "$HOST_BIND_ADDRESS:$IMAP_HOST_PORT → 143"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "SMTPS" "$HOST_BIND_ADDRESS:$SMTPS_HOST_PORT → 465"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Submission" "$HOST_BIND_ADDRESS:$SUBMISSION_HOST_PORT → 587"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "IMAPS" "$HOST_BIND_ADDRESS:$IMAPS_HOST_PORT → 993"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "Roundcube" "$HOST_BIND_ADDRESS:$ROUNDCUBE_HOST_PORT → 80"
+  printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "phpLDAPadmin" "$HOST_BIND_ADDRESS:$PHPLDAP_HOST_PORT → 8080"
   if (( PUBLISH_LDAP == 1 )); then
-    echo "    $LDAP_HOST_PORT    LDAP"
+    printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "LDAP" "$HOST_BIND_ADDRESS:$LDAP_HOST_PORT → 389"
   else
-    echo "    LDAP              internal Docker network only"
+    printf '  ${DIM}│${NC} %-22s ${DIM}│${NC} %-46s ${DIM}│${NC}\n' "LDAP" "internal only"
   fi
-
+  echo -e "  ${DIM}└────────────────────────┴──────────────────────────────────────────────┘${NC}"
   blank
+
+  # Mailbox accounts table
+  echo -e "  ${BOLD}${CYAN}Mailbox Accounts${NC}"
+  echo -e "  ${DIM}┌────────────────────────────────────────┬──────────┐${NC}"
+  printf '  ${DIM}│${NC} %-38s ${DIM}│${NC} %-8s ${DIM}│${NC}\n' "Email" "Role"
+  echo -e "  ${DIM}├────────────────────────────────────────┼──────────┤${NC}"
+  for ((i=0; i<${#ACCOUNTS[@]}; i++)); do
+    printf '  ${DIM}│${NC} %-38s ${DIM}│${NC} %-8s ${DIM}│${NC}\n' "${ACCOUNTS[$i]}" "${ACCOUNT_ROLES[$i]}"
+  done
+  echo -e "  ${DIM}└────────────────────────────────────────┴──────────┘${NC}"
+  blank
+
+  # Web access URLs
+  echo -e "  ${BOLD}${CYAN}Web Access${NC}"
+  echo -e "  ${GREEN}Roundcube (Webmail):${NC}       http://localhost:$ROUNDCUBE_HOST_PORT"
+  echo -e "  ${GREEN}phpLDAPadmin (LDAP UI):${NC}    http://localhost:$PHPLDAP_HOST_PORT"
+  if [[ "$HOST_BIND_ADDRESS" == "0.0.0.0" ]]; then
+    echo -e "  ${GREEN}LAN Roundcube:${NC}             http://$host_ip:$ROUNDCUBE_HOST_PORT"
+    echo -e "  ${GREEN}LAN phpLDAPadmin:${NC}          http://$host_ip:$PHPLDAP_HOST_PORT"
+  fi
+  blank
+
+  # Common commands with explanations
+  echo -e "  ${BOLD}${CYAN}Common Commands${NC}"
+  echo -e "  ${DIM}┌──────────────────────────────────────────────────────────────────────┐${NC}"
+  echo -e "  ${DIM}│${NC} ${BOLD}Command${NC}                                                           ${DIM}│${NC}"
+  echo -e "  ${DIM}├──────────────────────────────────────────────────────────────────────┤${NC}"
+  echo -e "  ${DIM}│${NC} cd $PROJECT_ROOT                                                    ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose ps                          # Show container status                 ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose logs -f mailserver          # Follow mailserver logs                ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose logs -f openldap            # Follow OpenLDAP logs                  ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose logs -f roundcube           # Follow Roundcube logs                 ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose logs -f phpldapadmin        # Follow phpLDAPadmin logs              ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose restart mailserver          # Restart mailserver after config change ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} exec $DMS_CONTAINER doveadm auth test <email> <password>                ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC}   # Test LDAP/Dovecot authentication for a mailbox                 ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} exec $LDAP_CONTAINER ldapsearch -x -LLL -H ldap://127.0.0.1:389             ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC}   -D \"$LDAP_ADMIN_DN\" -W -b \"ou=Users,$LDAP_BASE_DN\"                 ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC}   # Query LDAP for all mailbox entries                              ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} exec $DMS_CONTAINER setup config dkim                             ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC}   # Generate DKIM keys for the domain                                 ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose down                        # Stop all containers                    ${DIM}│${NC}"
+  echo -e "  ${DIM}│${NC} ${DC[*]} compose up -d                       # Start all containers                   ${DIM}│${NC}"
+  echo -e "  ${DIM}└──────────────────────────────────────────────────────────────────────┘${NC}"
+  blank
+
   echo -e "  ${YELLOW}Passwords are never printed.${NC}"
   echo -e "  ${BOLD}Full summary:${NC}            $PROJECT_ROOT/SETUP_SUMMARY.txt"
   echo -e "  ${BOLD}Feature tables:${NC}          $PROJECT_ROOT/CONFIGURATION_TABLE.md"
@@ -1986,7 +2057,6 @@ final_screen() {
 
   warn "For public Internet mail, use a real domain, DNS/MX/SPF/DKIM/DMARC, trusted TLS certificates, firewall rules, and standard public mail ports."
 }
-
 main() {
   show_banner
   ensure_prerequisites
@@ -2014,4 +2084,3 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     *) usage >&2; exit 2 ;;
   esac
 fi
-
